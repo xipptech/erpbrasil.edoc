@@ -1,15 +1,22 @@
 from types import SimpleNamespace
-from unittest import TestCase
+from unittest import TestCase, mock
 
+from erpbrasil.assinatura.assinatura import Assinatura
 from erpbrasil.base import misc
 from erpbrasil.edoc.provedores.cidades import NFSeFactory
 from erpbrasil.edoc.provedores.paulistana import Paulistana
 from erpbrasil.transmissao import TransmissaoSOAP
-from nfselib.paulistana.v02.PedidoEnvioLoteRPS import (
+from nfselib.paulistana.v03 import (
+    RetornoCancelamentoNFe_v02,
+    RetornoConsulta_v02,
+    RetornoEnvioLoteRPS_v02,
+)
+from nfselib.paulistana.v03.PedidoEnvioLoteRPS_v02 import (
     CabecalhoType,
     PedidoEnvioLoteRPS,
     tpChaveRPS,
     tpCPFCNPJ,
+    tpCPFCNPJNIF,
     tpEndereco,
     tpRPS,
 )
@@ -107,7 +114,7 @@ class PreparaDocumentosTests(TestCertificateMixin, TestCase):
 
         xml_assinado = self.nfse._prepara_envia_documento(edoc)
 
-        # a assinatura do RPS foi trocada pelo resultado (base64) da assinatura
+        # a assinatura do RPS (bytes) foi trocada pelo resultado da assinatura
         self.assertNotEqual(edoc.RPS[0].Assinatura, assinatura_original)
         self.assertIn("07865699000100", xml_assinado)
 
@@ -158,24 +165,77 @@ class PreparaDocumentosTests(TestCertificateMixin, TestCase):
         )
         self.assertIn("envia_documento", nfse_producao._servicos)
 
+    def _sign_spy(self):
+        return mock.patch.object(
+            Assinatura,
+            "sign_pkcs1v15_sha1",
+            autospec=True,
+            side_effect=Assinatura.sign_pkcs1v15_sha1,
+        )
+
+    def test_webservice_e_classes_de_retorno_v03(self):
+        self.assertEqual(self.nfse._url, "https://nfews.prefeitura.sp.gov.br")
+        servicos = self.nfse._servicos
+        self.assertEqual(servicos["envia_documento"].operacao, "TesteEnvioLoteRPS")
+        self.assertEqual(servicos["envia_documento"].endpoint, "lotenfe.asmx?WSDL")
+        self.assertIs(
+            servicos["envia_documento"].classe_retorno, RetornoEnvioLoteRPS_v02
+        )
+        self.assertIs(servicos["consulta_recibo"].classe_retorno, RetornoConsulta_v02)
+        self.assertIs(servicos["consulta_nfse_rps"].classe_retorno, RetornoConsulta_v02)
+        self.assertIs(
+            servicos["cancela_documento"].classe_retorno, RetornoCancelamentoNFe_v02
+        )
+
+    def test_prepara_envia_documento_assina_os_bytes_do_rps(self):
+        edoc = create_nfse_object()
+        assinatura_original = edoc.RPS[0].Assinatura
+
+        with self._sign_spy() as spy:
+            self.nfse._prepara_envia_documento(edoc)
+
+        self.assertEqual(spy.call_args.args[1], assinatura_original)
+        self.assertIsInstance(edoc.RPS[0].Assinatura, bytes)
+
+    def test_pedidos_usam_cabecalho_versao_2(self):
+        consulta_rps = self.nfse._prepara_consultar_nfse_rps(
+            cnpj_prest="07865699000100",
+            insc_prest="35707410",
+            serie_rps="111",
+            numero_rps="294",
+        )
+        consulta_lote = self.nfse._prepara_consulta_recibo(
+            SimpleNamespace(
+                retorno="<root><NumeroLote>123</NumeroLote>"
+                "<CNPJ>07865699000100</CNPJ></root>"
+            )
+        )
+        cancelamento = self.nfse._prepara_cancelar_nfse_envio({"numero_nfse": "1"})
+        for xml in (consulta_rps, consulta_lote, cancelamento):
+            self.assertIn('Versao="2"', xml)
+
+    def test_cancelamento_assina_inscricao_8_e_numero_12_digitos(self):
+        with self._sign_spy() as spy:
+            self.nfse._prepara_cancelar_nfse_envio({"numero_nfse": "1"})
+
+        self.assertEqual(spy.call_args.args[1], b"35707410" + b"000000000001")
+
 
 def create_nfse_object():
     return PedidoEnvioLoteRPS(
         Cabecalho=CabecalhoType(
-            Versao=1,
+            Versao=2,
             CPFCNPJRemetente=tpCPFCNPJ(CNPJ="07865699000100"),
             transacao=False,
             dtInicio="2020-10-29",
             dtFim="2020-10-29",
             QtdRPS=1,
-            ValorTotalServicos=100.0,
-            ValorTotalDeducoes=0.0,
         ),
         RPS=[
             tpRPS(
                 Assinatura=(
-                    "35707410111  0000000002942020102"
-                    "9TNN00000000001000000000000000000002692262228384000151"
+                    b"35707410111  0000000002942020102"
+                    b"9TNN00000000001000000000000000000002692262228384000151"
                 ),
                 ChaveRPS=tpChaveRPS(
                     InscricaoPrestador=35707410,
@@ -186,7 +246,6 @@ def create_nfse_object():
                 DataEmissao="2020-10-29",
                 StatusRPS="N",
                 TributacaoRPS="T",
-                ValorServicos=100.0,
                 ValorDeducoes=0.0,
                 ValorPIS=0.0,
                 ValorCOFINS=0.0,
@@ -196,7 +255,7 @@ def create_nfse_object():
                 CodigoServico=2692,
                 AliquotaServicos=0.0,
                 ISSRetido=False,
-                CPFCNPJTomador=tpCPFCNPJ(CNPJ="62228384000151"),
+                CPFCNPJTomador=tpCPFCNPJNIF(CNPJ="62228384000151"),
                 InscricaoEstadualTomador=621240850633,
                 RazaoSocialTomador="AMD South America Ltda",
                 EnderecoTomador=tpEndereco(
@@ -211,6 +270,7 @@ def create_nfse_object():
                 Discriminacao="[ODOO_DEV] Customized Odoo Development",
                 ValorCargaTributaria=0.0,
                 FonteCargaTributaria="100.0",
+                ValorFinalCobrado=100.0,
             )
         ],
     )
