@@ -22,6 +22,14 @@ except ImportError:
 
 endpoint = "nfeservice/wsrps.asmx?WSDL"
 
+SITUACOES_ARQUIVO = {
+    0: "Validated",
+    1: "Successfully Processed",
+    2: "Processed with Error",
+    -1: "Batch not yet processed",
+    -2: "Batch not yet processed",
+}
+
 if barueri:
     servicos = {
         "envia_documento": ServicoNFSe(
@@ -117,30 +125,52 @@ class Barueri(NFSe):
         )
         return raiz
 
-    def analisa_retorno_consulta(self, processo):
-        mensagem = ""
-        if processo.webservice == "NFeLoteStatusArquivo" and processo.resposta:
-            lista_msgs = processo.resposta.ListaMensagemRetorno
+    @staticmethod
+    def _mensagens_retorno(resposta):
+        """Normaliza ListaMensagemRetorno, que vem como container com
+        .MensagemRetorno, como lista ou como mensagem unica."""
+        lista_msgs = getattr(resposta, "ListaMensagemRetorno", None)
+        lista_msgs = getattr(lista_msgs, "MensagemRetorno", lista_msgs)
+        if lista_msgs is None:
+            return []
+        if not isinstance(lista_msgs, list):
+            return [lista_msgs]
+        return lista_msgs
 
-            if lista_msgs.Codigo != "OK200":
-                mensagem += (
-                    lista_msgs.Codigo
-                    + " - "
-                    + lista_msgs.Mensagem
-                    + " - Correção: "
-                    + lista_msgs.Correcao
-                    + "\n"
-                )
-            else:
-                status = int(processo.resposta.ListaNfeArquivosRPS.SituacaoArq)
-                if status == 0:
-                    mensagem = "Validated"
-                elif status == 1:
-                    mensagem = "Successfully Processed"
-                elif status == 2:
-                    mensagem = "Processed with Error"
-                elif status == -1 or status == -2:
-                    mensagem = "Batch not yet processed"
+    @staticmethod
+    def _formata_mensagem_retorno(msg):
+        """Monta o texto da mensagem ignorando os campos nao preenchidos:
+        Mensagem e Correcao sao opcionais no retorno do webservice."""
+        texto = " - ".join([campo for campo in (msg.Codigo, msg.Mensagem) if campo])
+        if msg.Correcao:
+            texto += " - Correção: " + msg.Correcao
+        return texto
+
+    def analisa_retorno_consulta(self, processo):
+        status = None
+        mensagem = ""
+
+        if processo.webservice != "NFeLoteStatusArquivo" or not processo.resposta:
+            return status, mensagem
+
+        erros = [
+            msg
+            for msg in self._mensagens_retorno(processo.resposta)
+            if msg.Codigo != "OK200"
+        ]
+        if erros:
+            mensagem = "".join(
+                [self._formata_mensagem_retorno(msg) + "\n" for msg in erros]
+            )
+            return status, mensagem
+
+        arquivos = getattr(processo.resposta, "ListaNfeArquivosRPS", None)
+        situacao = getattr(arquivos, "SituacaoArq", None)
+        if situacao is None:
+            return status, mensagem
+
+        status = int(situacao)
+        mensagem = SITUACOES_ARQUIVO.get(status, f"Situação desconhecida: {status}")
 
         return status, mensagem
 
